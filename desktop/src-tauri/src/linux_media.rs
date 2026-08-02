@@ -102,8 +102,36 @@ pub fn enable_media_capture<R: tauri::Runtime>(webview: &tauri::Webview<R>) {
     }
 }
 
+/// Maximum number of times the renderer may be auto-reloaded after a crash
+/// before giving up, to avoid an auto-reload crash-loop when the crash is
+/// deterministic on load (as in #4358's startup-enumeration segfault).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const MAX_RENDERER_AUTO_RELOADS: usize = 3;
+
+/// Sliding window (seconds) within which `MAX_RENDERER_AUTO_RELOADS` reloads
+/// are permitted. Older crashes age out, so a renderer that crashes rarely is
+/// still recovered each time.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const RENDERER_RELOAD_WINDOW_SECS: u64 = 120;
+
+/// Decide whether the renderer may be auto-reloaded given the timestamps of
+/// recent crashes. `attempt` (seconds since some epoch) is the time of the
+/// crash currently being handled. Pure and platform-independent so it can be
+/// unit-tested everywhere; the caller prunes/out-dates entries itself by
+/// passing only crashes within the window.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn should_auto_reload_renderer(recent_crashes: &[u64], attempt: u64) -> bool {
+    recent_crashes
+        .iter()
+        .filter(|&&t| attempt.saturating_sub(t) < RENDERER_RELOAD_WINDOW_SECS)
+        .count()
+        < MAX_RENDERER_AUTO_RELOADS
+}
+
 /// Log when the `WebKitWebProcess` (renderer) terminates, so a renderer crash
-/// surfaces as a diagnosable log line instead of a silent dead window.
+/// surfaces as a diagnosable log line instead of a silent dead window, and
+/// auto-reload the renderer to recover — rate-limited so a deterministic
+/// startup crash does not loop (see #4359).
 ///
 /// Without a handler the renderer can die (e.g. an upstream PipeWire/GStreamer
 /// segfault, OOM, or a WebKit bug) while the main `buzz-desktop` and
@@ -113,17 +141,42 @@ pub fn enable_media_capture<R: tauri::Runtime>(webview: &tauri::Webview<R>) {
 /// / `TerminatedByApi`. A no-op on non-Linux targets.
 #[cfg(target_os = "linux")]
 pub fn install_web_process_terminated_handler<R: tauri::Runtime>(webview: &tauri::Webview<R>) {
+    use std::{cell::RefCell, rc::Rc, time::Instant};
     use webkit2gtk::{glib::prelude::Cast, WebViewExt};
 
-    let webview = webview.clone();
-    let result = webview.with_webview(|platform_webview| {
+    // Crash timestamps, elapsed seconds since handler install, in a shared cell
+    // the `Fn + 'static` signal closure can inspect and update. Single-threaded
+    // (GTK fires on the UI thread), so `Rc<RefCell<..>>` is sufficient.
+    let t0 = Instant::now();
+    let crash_times: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let result = webview.with_webview(move |platform_webview| {
+        let crash_times = Rc::clone(&crash_times);
         platform_webview
             .inner()
-            .connect_web_process_terminated(|_webview, reason| {
+            .connect_web_process_terminated(move |webview, reason| {
                 eprintln!(
                     "buzz-desktop: WebKitWebProcess terminated (reason: {reason:?}); \
                      the window may appear frozen. See #4359."
                 );
+
+                let attempt = t0.elapsed().as_secs();
+                let mut crashes = crash_times.borrow_mut();
+                let can_reload = should_auto_reload_renderer(&crashes, attempt);
+                if can_reload {
+                    crashes.push(attempt);
+                    eprintln!(
+                        "buzz-desktop: reloading renderer after termination \
+                         ({}/{MAX_RENDERER_AUTO_RELOADS} within {RENDERER_RELOAD_WINDOW_SECS}s)"
+                    );
+                    webview.reload();
+                } else {
+                    eprintln!(
+                        "buzz-desktop: not auto-reloading renderer — exceeded \
+                         {MAX_RENDERER_AUTO_RELOADS} reloads within \
+                         {RENDERER_RELOAD_WINDOW_SECS}s; restart the app to recover."
+                    );
+                }
             });
     });
 
@@ -143,7 +196,7 @@ pub fn install_web_process_terminated_handler<R: tauri::Runtime>(_webview: &taur
 
 #[cfg(test)]
 mod tests {
-    use super::is_trusted_media_origin;
+    use super::{is_trusted_media_origin, should_auto_reload_renderer};
 
     #[test]
     fn allows_production_app_origin() {
@@ -176,5 +229,23 @@ mod tests {
     #[test]
     fn denies_dev_origin_in_release() {
         assert!(!is_trusted_media_origin("http://localhost:1420"));
+    }
+
+    #[test]
+    fn auto_reload_allowed_below_cap_within_window() {
+        // Fewer than MAX crashes inside the window -> reload allowed.
+        assert!(should_auto_reload_renderer(&[], 100));
+        assert!(should_auto_reload_renderer(&[95, 96], 100));
+        // Exactly at cap -> blocked.
+        assert!(!should_auto_reload_renderer(&[94, 95, 96], 100));
+    }
+
+    #[test]
+    fn auto_reload_ignores_crashes_older_than_window() {
+        let window = 120;
+        // Two old crashes (outside window) should not count -> reload allowed.
+        assert!(should_auto_reload_renderer(&[0, 1], 0 + window + 1 + 100));
+        // Saturating subtraction guards against attempt < logged time.
+        assert!(should_auto_reload_renderer(&[5], 0));
     }
 }
